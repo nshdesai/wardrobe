@@ -15,6 +15,12 @@ Your clothes, extracted and organized with gpt-image.
 
 ![Modeled wardrobe editor](docs/screenshots/editor.png)
 
+## Private phone + computer setup
+
+For a personal install, keep the app and all wardrobe data on your computer and use Tailscale Serve to reach it privately from your phone. Edits, deletes, and imports from either device share the same local database, and the phone can install Wardrobe on its Home Screen.
+
+[Set up the private personal app →](docs/PERSONAL_SETUP.md)
+
 ## Quick start
 
 ```bash

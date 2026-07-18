@@ -1,11 +1,12 @@
 @import "@fontsource-variable/instrument-sans";
 
 :root {
-  --paper: #f4f0e8;
-  --ink: #191919;
-  --muted: #66625d;
-  --line: #cfc8bc;
-  --accent: #6e302e;
+  --paper: #eef1f2;
+  --surface: #f8faf9;
+  --ink: #15181a;
+  --muted: #62696c;
+  --line: #c6ccce;
+  --accent: #31586b;
   font-family: "Instrument Sans Variable", "Helvetica Neue", Arial, sans-serif;
   color: var(--ink);
   background: var(--paper);
@@ -46,6 +47,56 @@ button { font: inherit; }
   align-items: center;
   justify-content: space-between;
   gap: 24px;
+}
+
+.gallery-title p {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 560;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+}
+
+.gallery-title h1 {
+  margin: 0;
+  font-size: clamp(28px, 3.2vw, 46px);
+  font-weight: 480;
+  letter-spacing: -.055em;
+  line-height: .95;
+}
+
+.gallery-status {
+  display: grid;
+  justify-items: end;
+  gap: 12px;
+}
+
+.connection-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.connection-status > span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #8b9699;
+  box-shadow: 0 0 0 3px rgba(98, 105, 108, .1);
+}
+
+.connection-status.is-connected > span {
+  background: #3f7359;
+  box-shadow: 0 0 0 3px rgba(63, 115, 89, .12);
+}
+
+.connection-status.is-saved > span {
+  background: #b5793d;
+  box-shadow: 0 0 0 3px rgba(181, 121, 61, .12);
 }
 
 .piece-count {
@@ -464,6 +515,25 @@ button { font: inherit; }
   margin-top: 24px;
 }
 
+.viewer-action-error {
+  margin: 14px 0 -8px;
+  color: #8a3f35;
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: right;
+}
+
+.delete-confirmation {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.delete-confirmation > span {
+  color: var(--accent);
+  font-size: 11px;
+}
+
 .unsaved-notice {
   margin: 14px 0 -8px;
   color: var(--accent);
@@ -515,6 +585,10 @@ button { font: inherit; }
 .delete-button { border-color: transparent; padding-left: 0; color: var(--accent); }
 .sample-button.active { border-color: var(--accent); color: var(--accent); }
 .action-spacer { flex: 1; }
+
+.primary-button:disabled,
+.secondary-button:disabled,
+.delete-button:disabled { opacity: .45; cursor: default; }
 
 .edit-button:hover,
 .edit-button:focus-visible,
@@ -899,6 +973,12 @@ button { font: inherit; }
   .color-controls { align-items: flex-start; flex-direction: column; }
   .sample-button { width: 100%; }
   .gallery-meta-row { align-items: flex-start; }
+  .gallery-title h1 { font-size: 32px; }
+  .gallery-status { gap: 9px; }
+  .connection-status { font-size: 10px; }
+  .viewer-actions { flex-wrap: wrap; }
+  .delete-confirmation { width: 100%; }
+  .delete-confirmation + .action-spacer { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -65,6 +65,51 @@ function normalizeMetadata(value = {}) {
   };
 }
 
+function normalizeLibraryItem(value, existing) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw Object.assign(new Error("item must be an object"), { status: 400 });
+  }
+
+  const name = typeof value.name === "string" ? value.name.trim().slice(0, 120) : existing.name;
+  if (!name) throw Object.assign(new Error("name is required"), { status: 400 });
+
+  const part = value.part === undefined ? existing.part : value.part;
+  if (!PARTS.has(part)) throw Object.assign(new Error("invalid wardrobe category"), { status: 400 });
+
+  const color = value.color === undefined ? existing.color : value.color;
+  if (typeof color !== "string" || !HEX_COLOR.test(color)) {
+    throw Object.assign(new Error("color must be a six-digit hex value"), { status: 400 });
+  }
+
+  const secondaryColor = value.secondaryColor === undefined ? existing.secondaryColor : value.secondaryColor;
+  if (secondaryColor !== null && (typeof secondaryColor !== "string" || !HEX_COLOR.test(secondaryColor))) {
+    throw Object.assign(new Error("secondaryColor must be null or a six-digit hex value"), { status: 400 });
+  }
+
+  const sourceTags = value.tags === undefined ? existing.tags : value.tags;
+  if (!Array.isArray(sourceTags)) throw Object.assign(new Error("tags must be an array"), { status: 400 });
+  const tags = sourceTags
+    .filter((tag) => typeof tag === "string")
+    .map((tag) => tag.trim().toLowerCase().slice(0, 40))
+    .filter(Boolean)
+    .slice(0, 12);
+  const normalizedColor = color.toLowerCase();
+  const normalizedSecondary = secondaryColor?.toLowerCase() || null;
+  const palette = [normalizedColor, normalizedSecondary, ...(existing.palette || [])]
+    .filter((entry, index, entries) => entry && entries.findIndex((candidate) => candidate.toLowerCase() === entry.toLowerCase()) === index)
+    .slice(0, 5);
+
+  return {
+    ...existing,
+    name,
+    part,
+    color: normalizedColor,
+    secondaryColor: normalizedSecondary,
+    palette,
+    tags,
+  };
+}
+
 function normalizeBoundingBox(value = {}) {
   const box = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const number = (key, fallback) => Number.isFinite(Number(box[key])) ? Math.round(Number(box[key])) : fallback;
@@ -345,6 +390,7 @@ export function wardrobeImportApi(options = {}) {
   let jobsDir;
   let importedFile;
   let libraryAssetDir;
+  let importedWrites = Promise.resolve();
   const running = new Map();
   const setting = (name, fallback = "") => options.env?.[name] || process.env[name] || fallback;
   const apiBaseUrl = () => setting("OPENAI_API_BASE_URL", "https://api.openai.com/v1").replace(/\/$/, "");
@@ -383,6 +429,17 @@ export function wardrobeImportApi(options = {}) {
     catch (error) { if (error.code === "ENOENT") return []; throw error; }
   }
 
+  function mutateImported(mutator) {
+    const operation = importedWrites.then(async () => {
+      const records = await loadImported();
+      const result = await mutator(records);
+      await atomicJson(importedFile, result.records);
+      return result.value;
+    });
+    importedWrites = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
   async function persistImported(job, includeModeled = false) {
     const id = `import-${job.id}`;
     await mkdir(libraryAssetDir, { recursive: true });
@@ -401,24 +458,26 @@ export function wardrobeImportApi(options = {}) {
       modeledImage = `${LIBRARY_ASSET_ROOT}/${modeledName}`;
     }
     const metadata = job.metadata || {};
-    const records = await loadImported();
-    const existing = records.find((record) => record.id === id);
-    const record = {
-      id,
-      name: metadata.name || "New piece",
-      part: metadata.part || "upperbody",
-      color: metadata.color || "#d8d0c2",
-      secondaryColor: metadata.secondaryColor || null,
-      palette: [metadata.color, metadata.secondaryColor].filter(Boolean),
-      tags: Array.isArray(metadata.tags) ? metadata.tags : [],
-      image: `${LIBRARY_ASSET_ROOT}/${garmentName}`,
-      thumbnail: `${LIBRARY_ASSET_ROOT}/${garmentName}`,
-      modeledImage: modeledImage || existing?.modeledImage || null,
-      importJobId: job.id,
-    };
-    const next = [...records.filter((item) => item.id !== id), record];
-    await atomicJson(importedFile, next);
-    return record;
+    return mutateImported((records) => {
+      const existing = records.find((record) => record.id === id);
+      const record = {
+        id,
+        name: metadata.name || "New piece",
+        part: metadata.part || "upperbody",
+        color: metadata.color || "#d8d0c2",
+        secondaryColor: metadata.secondaryColor || null,
+        palette: [metadata.color, metadata.secondaryColor].filter(Boolean),
+        tags: Array.isArray(metadata.tags) ? metadata.tags : [],
+        image: `${LIBRARY_ASSET_ROOT}/${garmentName}`,
+        thumbnail: `${LIBRARY_ASSET_ROOT}/${garmentName}`,
+        modeledImage: modeledImage || existing?.modeledImage || null,
+        importJobId: job.id,
+      };
+      return {
+        records: [...records.filter((item) => item.id !== id), record],
+        value: record,
+      };
+    });
   }
 
   async function generate(job, stageName) {
@@ -497,13 +556,27 @@ export function wardrobeImportApi(options = {}) {
       if (url.pathname === "/api/import/config" && req.method === "GET") {
         return json(res, 200, await setupStatus());
       }
-      const wardrobeDeleteMatch = url.pathname.match(/^\/api\/import\/wardrobe\/(import-[a-f0-9-]{36})$/i);
-      if (wardrobeDeleteMatch && req.method === "DELETE") {
-        const id = wardrobeDeleteMatch[1];
-        const records = await loadImported();
-        const next = records.filter((record) => record.id !== id);
-        if (next.length === records.length) return json(res, 404, { error: "Imported wardrobe item not found" });
-        await atomicJson(importedFile, next);
+      const wardrobeItemMatch = url.pathname.match(/^\/api\/import\/wardrobe\/(import-[a-f0-9-]{36})$/i);
+      if (wardrobeItemMatch && (req.method === "PATCH" || req.method === "PUT")) {
+        const id = wardrobeItemMatch[1];
+        const input = await body(req, 64 * 1024);
+        const updated = await mutateImported((records) => {
+          const index = records.findIndex((record) => record.id === id);
+          if (index === -1) throw Object.assign(new Error("Wardrobe item not found"), { status: 404 });
+          const item = normalizeLibraryItem(input.item || input, records[index]);
+          const next = [...records];
+          next[index] = item;
+          return { records: next, value: item };
+        });
+        return json(res, 200, updated);
+      }
+      if (wardrobeItemMatch && req.method === "DELETE") {
+        const id = wardrobeItemMatch[1];
+        await mutateImported((records) => {
+          const next = records.filter((record) => record.id !== id);
+          if (next.length === records.length) throw Object.assign(new Error("Wardrobe item not found"), { status: 404 });
+          return { records: next, value: undefined };
+        });
         await Promise.all([
           rm(path.join(libraryAssetDir, `${id}-garment.png`), { force: true }),
           rm(path.join(libraryAssetDir, `${id}-modeled.png`), { force: true }),
