@@ -104,6 +104,7 @@
 .import-icon-button:hover,
 .import-icon-button:focus-visible { background: rgba(255, 255, 255, 0.12); outline: none; }
 .import-tray__button:active, .import-icon-button:active { transform: scale(0.94); }
+.import-icon-button:disabled { cursor: default; opacity: 0.42; }
 
 .import-tray__actions {
   display: flex;
@@ -261,6 +262,31 @@
 .import-color-row { display: grid; grid-template-columns: 52px 1fr; gap: 8px; }
 .import-color-row input[type="color"] { height: 44px; padding: 5px; cursor: pointer; }
 .import-field-error { color: #8a3f35; font-size: 10px; line-height: 1.35; }
+.import-product-match {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(73, 96, 75, 0.28);
+  border-radius: 12px;
+  background: rgba(73, 96, 75, 0.06);
+}
+.import-product-match span { grid-column: 1 / -1; color: #49604b; font-size: 9px; letter-spacing: .11em; text-transform: uppercase; }
+.import-product-match strong { min-width: 0; overflow: hidden; color: var(--import-ink); font-size: 12px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+.import-product-match a { color: #49604b; font-size: 10px; text-decoration: underline; text-underline-offset: 3px; }
+.import-reference-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 2px;
+  color: var(--import-muted);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid currentColor;
+  font: 500 11px/1.2 "Instrument Sans", sans-serif;
+  cursor: pointer;
+}
+.import-reference-link:disabled { cursor: default; border-color: transparent; opacity: .65; }
 .import-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
 .import-button { min-height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 0 16px; border: 1px solid var(--import-line); border-radius: 999px; color: var(--import-ink); background: transparent; font: 500 12px/1 "Instrument Sans", sans-serif; cursor: pointer; }
 .import-button--primary { color: var(--import-paper); background: var(--import-ink); border-color: var(--import-ink); }

@@ -10,6 +10,8 @@ const STAGES = new Set(["crop", "garment", "modeled"]);
 const DECISIONS = new Set(["approve", "reject"]);
 const PARTS = new Set(["upperbody", "wholebody_up", "lowerbody", "accessories_up", "shoes"]);
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+const PRODUCT_CONFIDENCE = new Set(["exact", "likely", "unknown"]);
+const MAX_MODEL_REFERENCES = 5;
 
 function json(res, status, value) {
   res.statusCode = status;
@@ -62,7 +64,76 @@ function normalizeMetadata(value = {}) {
     secondaryColor,
     tags: Array.isArray(metadata.tags) ? metadata.tags.filter((tag) => typeof tag === "string").map((tag) => tag.trim().toLowerCase().slice(0, 40)).filter(Boolean).slice(0, 12) : [],
     boundingBox: normalizeBoundingBox(metadata.boundingBox),
+    brand: typeof metadata.brand === "string" ? metadata.brand.trim().slice(0, 80) || null : null,
+    productName: typeof metadata.productName === "string" ? metadata.productName.trim().slice(0, 160) || null : null,
+    productColorway: typeof metadata.productColorway === "string" ? metadata.productColorway.trim().slice(0, 120) || null : null,
+    productUrl: validHttpUrl(metadata.productUrl),
+    productConfidence: PRODUCT_CONFIDENCE.has(metadata.productConfidence) ? metadata.productConfidence : "unknown",
+    productEvidence: Array.isArray(metadata.productEvidence) ? metadata.productEvidence.filter((item) => typeof item === "string").map((item) => item.trim().slice(0, 180)).filter(Boolean).slice(0, 6) : [],
+    productSources: normalizeProductSources(metadata.productSources),
   };
+}
+
+function validHttpUrl(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) ? url.href.slice(0, 1000) : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeProductSources(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value.flatMap((source) => {
+    const url = validHttpUrl(typeof source === "string" ? source : source?.url);
+    if (!url || seen.has(url)) return [];
+    seen.add(url);
+    return [{ url, title: typeof source?.title === "string" ? source.title.trim().slice(0, 180) || null : null }];
+  }).slice(0, 8);
+}
+
+function normalizeProductMatch(value = {}, responseSources = []) {
+  const confidence = PRODUCT_CONFIDENCE.has(value.confidence) ? value.confidence : "unknown";
+  const sources = normalizeProductSources(Array.isArray(responseSources) ? responseSources : []);
+  const requestedUrl = validHttpUrl(value.sourceUrl);
+  const source = sources.find((item) => item.url === requestedUrl) || sources[0] || null;
+  const hasCandidate = confidence !== "unknown";
+  const brand = hasCandidate && typeof value.brand === "string" ? value.brand.trim().slice(0, 80) || null : null;
+  const productName = hasCandidate && typeof value.productName === "string" ? value.productName.trim().slice(0, 160) || null : null;
+  return {
+    brand,
+    productName,
+    colorway: hasCandidate && typeof value.colorway === "string" ? value.colorway.trim().slice(0, 120) || null : null,
+    confidence: confidence === "exact" && (!brand || !productName || !source) ? "likely" : confidence,
+    evidence: Array.isArray(value.identifyingFeatures) ? value.identifyingFeatures.filter((item) => typeof item === "string").map((item) => item.trim().slice(0, 180)).filter(Boolean).slice(0, 6) : [],
+    summary: typeof value.summary === "string" ? value.summary.trim().slice(0, 400) || null : null,
+    sourceUrl: source?.url || null,
+    sourceTitle: source?.title || null,
+    sources,
+  };
+}
+
+function applyProductMatch(metadata, match) {
+  const exact = match.confidence === "exact" && match.brand && match.productName;
+  const brandTag = match.brand?.toLowerCase();
+  const tags = [...(metadata.tags || []), ...(brandTag ? [brandTag] : [])]
+    .filter((tag, index, values) => values.indexOf(tag) === index)
+    .slice(0, 12);
+  return normalizeMetadata({
+    ...metadata,
+    name: exact ? `${match.brand} ${match.productName}` : metadata.name,
+    tags,
+    brand: match.brand,
+    productName: match.productName,
+    productColorway: match.colorway,
+    productUrl: match.sourceUrl,
+    productConfidence: match.confidence,
+    productEvidence: match.evidence,
+    productSources: match.sources,
+  });
 }
 
 function normalizeLibraryItem(value, existing) {
@@ -159,6 +230,9 @@ export function buildGarmentPrompt(metadata = {}, chromaKey = "#00ff00") {
   const details = Array.isArray(metadata.tags) && metadata.tags.length
     ? metadata.tags.join(", ")
     : "all visible construction and design details";
+  const productEvidence = metadata.productName
+    ? `\nProduct research: The photograph was matched ${metadata.productConfidence === "exact" ? "with high confidence" : "as a possible match"} to ${[metadata.brand, metadata.productName, metadata.productColorway].filter(Boolean).join(" — ")}. Distinguishing evidence: ${(metadata.productEvidence || []).join("; ") || "the visible construction in the source photograph"}. Use these researched product details to resolve ambiguous seams, pockets, proportions, and technical construction, but let clearly visible evidence in the source photograph win if there is a conflict.`
+    : "";
 
   return `Use case: background-extraction
 Asset type: ecommerce catalog product cutout source
@@ -167,7 +241,7 @@ Input image: The reference photograph shows the exact garment, either by itself 
 
 Primary request: Reconstruct ONLY the complete empty ${name} (${category}) as a clean, front-facing ecommerce catalog product photograph. If a wearer is present, remove them. Remove every other garment, object, and background element. Show the complete item naturally arranged and symmetrical, with no person, body, mannequin, or hanger visible.
 
-Garment fidelity: Preserve the reference garment's exact primary color ${primary}${secondary}, material and texture, silhouette, neckline, sleeves, fastenings, pattern, and distinctive details (${details}). Preserve any clearly legible existing graphic or logo exactly, but do not invent or reinterpret uncertain logos, text, pockets, seams, hardware, colors, or decoration.
+Garment fidelity: Preserve the reference garment's exact primary color ${primary}${secondary}, material and texture, silhouette, neckline, sleeves, fastenings, pattern, and distinctive details (${details}). Preserve any clearly legible existing graphic or logo exactly, but do not invent or reinterpret uncertain logos, text, pockets, seams, hardware, colors, or decoration.${productEvidence}
 
 Composition: Centered straight-on product view. Keep the entire garment inside the frame with generous, even padding on every side. No cropping or truncation.
 
@@ -420,11 +494,69 @@ async function openAIAnalyze({ key, baseUrl, model, image, mime }) {
   return parsed.items;
 }
 
+function responseProductSources(result) {
+  const sources = [];
+  for (const output of result.output || []) {
+    for (const source of output.action?.sources || []) sources.push(source);
+    for (const content of output.content || []) {
+      for (const annotation of content.annotations || []) {
+        if (annotation.type === "url_citation") sources.push({ url: annotation.url, title: annotation.title });
+      }
+    }
+  }
+  return normalizeProductSources(sources);
+}
+
+async function openAIProductMatch({ key, baseUrl, model, image, metadata }) {
+  const visualDescription = [metadata.name, ...(metadata.tags || []), metadata.color].filter(Boolean).join(", ");
+  const response = await openAIFetch(`${baseUrl}/responses`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      reasoning: { effort: "low" },
+      tools: [{
+        type: "web_search",
+        search_context_size: "medium",
+        search_content_types: ["text", "image"],
+        image_settings: { max_results: 6, caption: true },
+      }],
+      tool_choice: "required",
+      include: ["web_search_call.action.sources"],
+      input: [{ role: "user", content: [
+        { type: "input_text", text: `Identify the exact retail product shown in this clothing crop. The initial visual description is: ${visualDescription}. Use web search and product-image search to compare the crop with official brand product pages, archived product pages, and reputable catalog or resale listings. Look closely at logos, seams, pocket shapes, hems, waistbands, hardware, fabric, fit, and color blocking. Prefer an official product page when one exists.\n\nReturn confidence \"exact\" only when multiple visible, product-specific details agree with a sourced listing and distinguish this model from similar products. Return \"likely\" for one plausible candidate that is not fully proven. Return \"unknown\" when the photo cannot support a specific model. Never invent a brand, model, colorway, or URL. The source URL must be a page you actually consulted. Keep identifyingFeatures concrete and visible.` },
+        { type: "input_image", image_url: `data:image/png;base64,${image.toString("base64")}`, detail: "high" },
+      ] }],
+      text: { format: { type: "json_schema", name: "product_match", strict: true, schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          brand: { anyOf: [{ type: "string" }, { type: "null" }] },
+          productName: { anyOf: [{ type: "string" }, { type: "null" }] },
+          colorway: { anyOf: [{ type: "string" }, { type: "null" }] },
+          confidence: { type: "string", enum: ["exact", "likely", "unknown"] },
+          identifyingFeatures: { type: "array", items: { type: "string" }, maxItems: 6 },
+          summary: { type: "string" },
+          sourceUrl: { anyOf: [{ type: "string" }, { type: "null" }] },
+          sourceTitle: { anyOf: [{ type: "string" }, { type: "null" }] },
+        },
+        required: ["brand", "productName", "colorway", "confidence", "identifyingFeatures", "summary", "sourceUrl", "sourceTitle"],
+      } } },
+    }),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error?.message || `OpenAI product search failed (${response.status})`);
+  const outputText = result.output_text || result.output?.flatMap((item) => item.content || []).find((item) => item.type === "output_text")?.text;
+  if (!outputText) throw new Error("OpenAI product search returned no structured result");
+  return normalizeProductMatch(JSON.parse(outputText), responseProductSources(result));
+}
+
 export function wardrobeImportApi(options = {}) {
   let root;
   let jobsDir;
   let importedFile;
   let libraryAssetDir;
+  let modelReferencesDir;
   let importedWrites = Promise.resolve();
   const running = new Map();
   const pendingTasks = [];
@@ -433,7 +565,9 @@ export function wardrobeImportApi(options = {}) {
   const apiBaseUrl = () => setting("OPENAI_API_BASE_URL", "https://api.openai.com/v1").replace(/\/$/, "");
   const modelReferenceSetting = () => setting("WARDROBE_MODEL_REFERENCE", "data/model-reference.png");
   const modelReferencePath = () => path.resolve(root, modelReferenceSetting());
+  const modelReferencesDirSetting = () => setting("WARDROBE_MODEL_REFERENCES_DIR");
   const taskConcurrency = () => Math.max(1, Math.min(4, Number.parseInt(setting("WARDROBE_IMPORT_CONCURRENCY", "2"), 10) || 2));
+  const productLookupEnabled = () => setting("WARDROBE_PRODUCT_LOOKUP", "true").toLowerCase() !== "false";
 
   function drainTasks() {
     while (activeTasks < taskConcurrency() && pendingTasks.length) {
@@ -461,21 +595,41 @@ export function wardrobeImportApi(options = {}) {
     return promise;
   }
 
-  async function setupStatus() {
-    const hasApiKey = Boolean(setting("OPENAI_API_KEY").trim());
-    const referenceSetting = modelReferenceSetting();
-    const referencePath = modelReferencePath();
-    let hasModelReference = false;
+  async function loadModelReferences() {
+    const candidates = [];
     try {
-      hasModelReference = (await stat(referencePath)).isFile();
+      candidates.push({ data: await readFile(modelReferencePath()), name: "model-reference.png" });
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+    const filenames = (await readdir(modelReferencesDir).catch((error) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    })).filter((filename) => filename.toLowerCase().endsWith(".png")).sort();
+    for (const filename of filenames) candidates.push({ data: await readFile(path.join(modelReferencesDir, filename)), name: filename });
+    const seen = new Set();
+    return candidates.filter((candidate) => {
+      const hash = createHash("sha256").update(candidate.data).digest("hex");
+      if (seen.has(hash)) return false;
+      seen.add(hash);
+      return true;
+    }).slice(0, MAX_MODEL_REFERENCES);
+  }
+
+  async function setupStatus(extra = {}) {
+    const hasApiKey = Boolean(setting("OPENAI_API_KEY").trim());
+    const referenceSetting = modelReferenceSetting();
+    const modelReferences = await loadModelReferences();
+    const hasModelReference = modelReferences.length > 0;
     return {
       ready: hasApiKey && hasModelReference,
       hasApiKey,
       hasModelReference,
       modelReference: referenceSetting,
+      modelReferenceCount: modelReferences.length,
+      maxModelReferences: MAX_MODEL_REFERENCES,
+      productLookupEnabled: productLookupEnabled(),
+      ...extra,
     };
   }
 
@@ -514,6 +668,9 @@ export function wardrobeImportApi(options = {}) {
       ? path.basename(new URL(job.stages.garment.assetUrl, "http://localhost").pathname)
       : `garment-${job.stages.garment.attempts}.png`;
     await copyFile(path.join(jobsDir, job.id, garmentSource), path.join(libraryAssetDir, garmentName));
+    const sourceName = `${id}-source.png`;
+    const sourceFile = job.internal.cropFile || job.internal.originalFile;
+    if (sourceFile) await copyFile(path.join(jobsDir, job.id, sourceFile), path.join(libraryAssetDir, sourceName));
     let modeledImage = null;
     if (includeModeled) {
       const modeledName = `${id}-modeled.png`;
@@ -534,8 +691,18 @@ export function wardrobeImportApi(options = {}) {
         secondaryColor: metadata.secondaryColor || null,
         palette: [metadata.color, metadata.secondaryColor].filter(Boolean),
         tags: Array.isArray(metadata.tags) ? metadata.tags : [],
+        brand: metadata.brand || null,
+        productName: metadata.productName || null,
+        productColorway: metadata.productColorway || null,
+        productUrl: metadata.productUrl || null,
+        productConfidence: metadata.productConfidence || "unknown",
+        productEvidence: Array.isArray(metadata.productEvidence) ? metadata.productEvidence : [],
+        productSources: normalizeProductSources(metadata.productSources),
+        productMatchSummary: job.productMatch?.summary || null,
+        productSourceTitle: job.productMatch?.sourceTitle || null,
         image: `${LIBRARY_ASSET_ROOT}/${garmentName}`,
         thumbnail: `${LIBRARY_ASSET_ROOT}/${garmentName}`,
+        sourceImage: `${LIBRARY_ASSET_ROOT}/${sourceName}`,
         modeledImage: modeledImage || existing?.modeledImage || null,
         importJobId: job.id,
       };
@@ -568,6 +735,7 @@ export function wardrobeImportApi(options = {}) {
         autoProcess,
         status: "active",
         metadata,
+        productMatch: { status: productLookupEnabled() ? "queued" : "disabled", confidence: "unknown", error: null, updatedAt: now },
         stages: { crop: cropStage, garment: garmentStage, modeled: stageState() },
         createdAt: now,
         updatedAt: now,
@@ -664,6 +832,26 @@ export function wardrobeImportApi(options = {}) {
         const original = { data: await readFile(path.join(dir, sourceFile)), mime: "image/png", name: sourceFile };
         let bytes;
         if (stageName === "garment") {
+          if (productLookupEnabled() && current.productMatch?.status !== "complete") {
+            current.productMatch = { ...(current.productMatch || {}), status: "processing", error: null, updatedAt: new Date().toISOString() };
+            await saveJob(current);
+            try {
+              const match = await openAIProductMatch({
+                key,
+                baseUrl: apiBaseUrl(),
+                model: setting("OPENAI_PRODUCT_MODEL", setting("OPENAI_VISION_MODEL", "gpt-5.4-mini")),
+                image: original.data,
+                metadata: current.metadata,
+              });
+              current.metadata = applyProductMatch(current.metadata, match);
+              current.productMatch = { ...match, status: "complete", error: null, updatedAt: new Date().toISOString() };
+              await saveJob(current);
+            } catch (error) {
+              current.productMatch = { ...(current.productMatch || {}), status: "unavailable", confidence: "unknown", error: error.message, updatedAt: new Date().toISOString() };
+              await saveJob(current);
+              console.warn("[wardrobe queue] product search unavailable", { id: current.id, error: error.message });
+            }
+          }
           chromaKeyUsed = chooseChromaKey(current.metadata.color);
           const basePrompt = options.garmentPrompt || buildGarmentPrompt(current.metadata, chromaKeyUsed);
           bytes = await openAIEdit({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_GARMENT_MODEL", setting("OPENAI_IMAGE_MODEL", "gpt-image-2")), quality: setting("OPENAI_IMAGE_QUALITY", "high"), size: "1024x1024", images: [original], prompt: current.stages.garment.prompt ? `${basePrompt}\nUser regeneration direction: ${current.stages.garment.prompt}` : basePrompt });
@@ -677,17 +865,13 @@ export function wardrobeImportApi(options = {}) {
             : `garment-${current.stages.garment.attempts}.png`;
           const garmentFile = path.join(dir, garmentName);
           const garment = { data: await readFile(garmentFile), mime: "image/png", name: "garment.png" };
-          const modelPath = modelReferencePath();
-          let modelData;
-          try {
-            modelData = await readFile(modelPath);
-          } catch (error) {
-            if (error.code === "ENOENT") throw new Error(`Model reference not found at ${modelPath}. Set WARDROBE_MODEL_REFERENCE or add data/model-reference.png.`);
-            throw error;
-          }
-          const model = { data: modelData, mime: "image/png", name: "model.png" };
-          const basePrompt = options.modeledPrompt || "Create a professional horizontal 3:2 editorial fashion photograph of the person in Image 1 wearing the exact garment from Image 2. Preserve the person's recognizable identity, face, hair, age and proportions. Preserve every garment color, material, fit, construction, graphic, logo and distinctive detail. Keep the complete featured item clearly visible and unobstructed, use understated neutral supporting clothes, realistic anatomy, natural light, authentic fabric, a tasteful real-world setting, and leave environmental space around the model. No text, watermark, product mockup, or synthetic appearance.";
-          bytes = await openAIEdit({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_MODELED_MODEL", setting("OPENAI_IMAGE_MODEL", "gpt-image-2")), quality: setting("OPENAI_IMAGE_QUALITY", "high"), size: "1536x1024", images: [model, garment], prompt: current.stages.modeled.prompt ? `${basePrompt}\nUser regeneration direction: ${current.stages.modeled.prompt}` : basePrompt });
+          const modelReferences = await loadModelReferences();
+          if (!modelReferences.length) throw new Error("No styling reference photos are saved. Add at least one from Wardrobe setup.");
+          const modelImages = modelReferences.map((reference, index) => ({ data: reference.data, mime: "image/png", name: `person-${index + 1}.png` }));
+          const garmentImageNumber = modelImages.length + 1;
+          const identityImages = modelImages.length === 1 ? "Image 1 shows the person" : `Images 1 through ${modelImages.length} show the same person from different photos`;
+          const basePrompt = options.modeledPrompt || `Create a professional horizontal 3:2 editorial fashion photograph. ${identityImages}; synthesize them as complementary identity and body-shape evidence, not as different people. Show that same recognizable person wearing the exact garment from Image ${garmentImageNumber}. Preserve the person's face, hair, age, skin tone, body proportions, and other stable identity traits across the references. Preserve every garment color, material, fit, construction, graphic, logo, and distinctive detail. Keep the complete featured item clearly visible and unobstructed, use understated neutral supporting clothes, realistic anatomy, natural light, authentic fabric, a tasteful real-world setting, and leave environmental space around the model. Show exactly one person. No text, watermark, product mockup, collage, or synthetic appearance.`;
+          bytes = await openAIEdit({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_MODELED_MODEL", setting("OPENAI_IMAGE_MODEL", "gpt-image-2")), quality: setting("OPENAI_IMAGE_QUALITY", "high"), size: "1536x1024", images: [...modelImages, garment], prompt: current.stages.modeled.prompt ? `${basePrompt}\nUser regeneration direction: ${current.stages.modeled.prompt}` : basePrompt });
         }
         await writeFile(output, bytes);
         const fresh = await loadJob(current.id);
@@ -738,20 +922,64 @@ export function wardrobeImportApi(options = {}) {
         return json(res, 200, await setupStatus());
       }
       if (url.pathname === "/api/import/model-reference" && req.method === "POST") {
-        const input = await body(req);
-        const image = decodeImage(input);
-        const normalizedImage = await normalizeImage(image.data);
-        const referencePath = modelReferencePath();
-        await mkdir(path.dirname(referencePath), { recursive: true });
-        const temporaryPath = `${referencePath}.${randomUUID()}.tmp`;
-        await writeFile(temporaryPath, normalizedImage);
-        try {
-          await rename(temporaryPath, referencePath);
-        } catch (error) {
-          await rm(temporaryPath, { force: true });
-          throw error;
+        const input = await body(req, 75 * 1024 * 1024);
+        const rawImages = Array.isArray(input.imageDataUrls) ? input.imageDataUrls : [input.imageDataUrl || input.imageBase64].filter(Boolean);
+        if (!rawImages.length) throw Object.assign(new Error("Choose at least one reference photo"), { status: 400 });
+        await mkdir(modelReferencesDir, { recursive: true });
+        const existing = await loadModelReferences();
+        const hashes = new Set(existing.map((reference) => createHash("sha256").update(reference.data).digest("hex")));
+        let addedModelReferenceCount = 0;
+        for (const raw of rawImages.slice(0, MAX_MODEL_REFERENCES)) {
+          if (hashes.size >= MAX_MODEL_REFERENCES) break;
+          const image = decodeImage({ imageDataUrl: raw });
+          const normalizedImage = await normalizeImage(image.data);
+          const hash = createHash("sha256").update(normalizedImage).digest("hex");
+          if (hashes.has(hash)) continue;
+          hashes.add(hash);
+          await writeFile(path.join(modelReferencesDir, `${hash}.png`), normalizedImage);
+          addedModelReferenceCount += 1;
         }
-        return json(res, 200, await setupStatus());
+        return json(res, 200, await setupStatus({ addedModelReferenceCount }));
+      }
+      const wardrobeProductMatch = url.pathname.match(/^\/api\/import\/wardrobe\/(import-[a-f0-9-]{36})\/product-match$/i);
+      if (wardrobeProductMatch && req.method === "POST") {
+        const id = wardrobeProductMatch[1];
+        const records = await loadImported();
+        const existing = records.find((record) => record.id === id);
+        if (!existing) throw Object.assign(new Error("Wardrobe item not found"), { status: 404 });
+        const key = setting("OPENAI_API_KEY");
+        if (!key) throw Object.assign(new Error("OPENAI_API_KEY is not configured"), { status: 503 });
+        const sourceUrl = existing.sourceImage || existing.image;
+        const sourceName = path.basename(new URL(sourceUrl, "http://localhost").pathname);
+        const sourceImage = await readFile(path.join(libraryAssetDir, sourceName));
+        const match = await openAIProductMatch({
+          key,
+          baseUrl: apiBaseUrl(),
+          model: setting("OPENAI_PRODUCT_MODEL", setting("OPENAI_VISION_MODEL", "gpt-5.4-mini")),
+          image: sourceImage,
+          metadata: existing,
+        });
+        const metadata = applyProductMatch(existing, match);
+        const updated = await mutateImported((currentRecords) => {
+          const record = currentRecords.find((item) => item.id === id);
+          if (!record) throw Object.assign(new Error("Wardrobe item not found"), { status: 404 });
+          const nextRecord = {
+            ...record,
+            name: metadata.name,
+            tags: metadata.tags,
+            brand: metadata.brand,
+            productName: metadata.productName,
+            productColorway: metadata.productColorway,
+            productUrl: metadata.productUrl,
+            productConfidence: metadata.productConfidence,
+            productEvidence: metadata.productEvidence,
+            productSources: metadata.productSources,
+            productMatchSummary: match.summary,
+            productSourceTitle: match.sourceTitle,
+          };
+          return { records: currentRecords.map((item) => item.id === id ? nextRecord : item), value: nextRecord };
+        });
+        return json(res, 200, updated);
       }
       const wardrobeItemMatch = url.pathname.match(/^\/api\/import\/wardrobe\/(import-[a-f0-9-]{36})$/i);
       if (wardrobeItemMatch && (req.method === "PATCH" || req.method === "PUT")) {
@@ -777,6 +1005,7 @@ export function wardrobeImportApi(options = {}) {
         await Promise.all([
           rm(path.join(libraryAssetDir, `${id}-garment.png`), { force: true }),
           rm(path.join(libraryAssetDir, `${id}-modeled.png`), { force: true }),
+          rm(path.join(libraryAssetDir, `${id}-source.png`), { force: true }),
         ]);
         return json(res, 200, { deleted: true, id });
       }
@@ -965,8 +1194,10 @@ export function wardrobeImportApi(options = {}) {
       jobsDir = path.join(dataDir, "jobs");
       importedFile = path.join(dataDir, "library.json");
       libraryAssetDir = path.join(dataDir, "imported");
+      modelReferencesDir = modelReferencesDirSetting() ? path.resolve(root, modelReferencesDirSetting()) : path.join(dataDir, "model-references");
       await mkdir(jobsDir, { recursive: true });
       await mkdir(libraryAssetDir, { recursive: true });
+      await mkdir(modelReferencesDir, { recursive: true });
       const ids = await readdir(jobsDir).catch(() => []);
       for (const id of ids) {
         const job = await loadJob(id);

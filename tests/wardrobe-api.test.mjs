@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,7 @@ const TEST_GARMENT_RESULT = await sharp({ create: { width: 64, height: 64, chann
   .composite([{ input: TEST_GARMENT, left: 20, top: 16 }])
   .png()
   .toBuffer();
+const TEST_REFERENCE_TWO = await sharp({ create: { width: 3, height: 4, channels: 3, background: "#805060" } }).png().toBuffer();
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -98,9 +99,10 @@ test("wardrobe edits and deletes persist for every client", async (context) => {
   await assert.rejects(readFile(modeledFile), { code: "ENOENT" });
 });
 
-test("a client can save the private model reference photo", async (context) => {
+test("a client can save several private styling reference photos", async (context) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "wardrobe-reference-"));
   const referenceFile = path.join(dataDir, "model-reference.png");
+  const referencesDir = path.join(dataDir, "model-references");
   process.env.WARDROBE_DATA_DIR = dataDir;
   process.env.WARDROBE_MODEL_REFERENCE = referenceFile;
   process.env.OPENAI_API_KEY = "test-project-key";
@@ -129,7 +131,10 @@ test("a client can save the private model reference photo", async (context) => {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      imageDataUrl: `data:image/png;base64,${TEST_PNG_BASE64}`,
+      imageDataUrls: [
+        `data:image/png;base64,${TEST_PNG_BASE64}`,
+        `data:image/png;base64,${TEST_REFERENCE_TWO.toString("base64")}`,
+      ],
     }),
   });
   assert.equal(referenceResponse.status, 200);
@@ -137,9 +142,83 @@ test("a client can save the private model reference photo", async (context) => {
   assert.equal(setup.ready, true);
   assert.equal(setup.hasApiKey, true);
   assert.equal(setup.hasModelReference, true);
+  assert.equal(setup.modelReferenceCount, 2);
+  assert.equal(setup.addedModelReferenceCount, 2);
 
-  const stored = await readFile(referenceFile);
+  const storedReferences = await readdir(referencesDir);
+  assert.equal(storedReferences.length, 2);
+  const stored = await readFile(path.join(referencesDir, storedReferences[0]));
   assert.equal(stored.subarray(1, 4).toString("ascii"), "PNG");
+});
+
+test("an existing wardrobe piece can be matched to a sourced product", async (context) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "wardrobe-product-"));
+  const importedDir = path.join(dataDir, "imported");
+  const libraryFile = path.join(dataDir, "library.json");
+  const item = {
+    id: ITEM_ID,
+    name: "red athletic shorts",
+    part: "lowerbody",
+    color: "#aa2222",
+    secondaryColor: null,
+    palette: ["#aa2222"],
+    tags: ["athletic", "logo"],
+    image: `/api/import/library/${ITEM_ID}-garment.png`,
+    thumbnail: `/api/import/library/${ITEM_ID}-garment.png`,
+    modeledImage: null,
+    importJobId: ITEM_ID.slice("import-".length),
+  };
+  await mkdir(importedDir, { recursive: true });
+  await writeFile(path.join(importedDir, `${ITEM_ID}-garment.png`), TEST_GARMENT);
+  await writeFile(libraryFile, `${JSON.stringify([item], null, 2)}\n`);
+
+  const productUrl = "https://shop.lululemon.com/p/men-shorts/Pace-Breaker-Short-7-Linerless/";
+  const openAI = createHttpServer((request, response) => {
+    void (async () => {
+      for await (const _chunk of request) { /* consume request */ }
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({
+        output_text: JSON.stringify({
+          brand: "Lululemon",
+          productName: "Pace Breaker Linerless Short 7\"",
+          colorway: "Dark Red",
+          confidence: "exact",
+          identifyingFeatures: ["curved side panel", "zippered pocket"],
+          summary: "The visible panel geometry matches the sourced product.",
+          sourceUrl: productUrl,
+          sourceTitle: "Pace Breaker Linerless Short 7\"",
+        }),
+        output: [{ type: "web_search_call", action: { sources: [{ url: productUrl, title: "Pace Breaker Linerless Short 7\"" }] } }],
+      }));
+    })();
+  });
+  await new Promise((resolve) => openAI.listen(0, "127.0.0.1", resolve));
+  const openAIAddress = openAI.address();
+  process.env.WARDROBE_DATA_DIR = dataDir;
+  process.env.OPENAI_API_KEY = "test-project-key";
+  process.env.OPENAI_API_BASE_URL = `http://127.0.0.1:${openAIAddress.port}`;
+
+  const server = await createServer({ optimizeDeps: { noDiscovery: true }, server: { host: "127.0.0.1", port: 0 } });
+  await server.listen();
+  const address = server.httpServer.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  context.after(async () => {
+    await server.close();
+    await new Promise((resolve) => openAI.close(resolve));
+    delete process.env.WARDROBE_DATA_DIR;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_BASE_URL;
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  const response = await fetch(`${baseUrl}/api/import/wardrobe/${ITEM_ID}/product-match`, { method: "POST" });
+  assert.equal(response.status, 200);
+  const matched = await response.json();
+  assert.equal(matched.name, "Lululemon Pace Breaker Linerless Short 7\"");
+  assert.equal(matched.productConfidence, "exact");
+  assert.equal(matched.productUrl, productUrl);
+  assert.deepEqual(JSON.parse(await readFile(libraryFile, "utf8")), [matched]);
 });
 
 test("uploads become durable background jobs and deleted work cannot crash the service", async (context) => {
@@ -262,19 +341,47 @@ test("uploads become durable background jobs and deleted work cannot crash the s
 test("new uploads automatically finish and enter the wardrobe", async (context) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "wardrobe-auto-"));
   const referenceFile = path.join(dataDir, "model-reference.png");
+  const referencesDir = path.join(dataDir, "model-references");
+  await mkdir(referencesDir, { recursive: true });
   await writeFile(referenceFile, Buffer.from(TEST_PNG_BASE64, "base64"));
+  await writeFile(path.join(referencesDir, "second.png"), TEST_REFERENCE_TWO);
   let imageRequests = 0;
+  let modeledImageInputCount = 0;
+  let productSearchRequests = 0;
 
   const openAI = createHttpServer((request, response) => {
     void (async () => {
-      for await (const _chunk of request) { /* consume request */ }
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const requestBody = Buffer.concat(chunks);
       response.setHeader("Content-Type", "application/json");
       if (request.url === "/responses") {
+        const payload = JSON.parse(requestBody.toString("utf8"));
+        if (payload.tools?.some((tool) => tool.type === "web_search")) {
+          productSearchRequests += 1;
+          response.end(JSON.stringify({
+            output_text: JSON.stringify({
+              brand: "Lululemon",
+              productName: "Pace Breaker Linerless Short 7\"",
+              colorway: "Dark Red",
+              confidence: "exact",
+              identifyingFeatures: ["curved side panels", "zippered side pocket", "seven-inch inseam"],
+              summary: "The visible panels and pocket placement match the sourced product.",
+              sourceUrl: "https://shop.lululemon.com/p/men-shorts/Pace-Breaker-Short-7-Linerless/",
+              sourceTitle: "Pace Breaker Linerless Short 7\"",
+            }),
+            output: [{
+              type: "web_search_call",
+              action: { sources: [{ url: "https://shop.lululemon.com/p/men-shorts/Pace-Breaker-Short-7-Linerless/", title: "Pace Breaker Linerless Short 7\"" }] },
+            }],
+          }));
+          return;
+        }
         response.end(JSON.stringify({
           output_text: JSON.stringify({
             items: [{
-              name: "Automatic red shirt",
-              part: "upperbody",
+              name: "Automatic red shorts",
+              part: "lowerbody",
               color: "#cc2222",
               secondaryColor: null,
               tags: ["automatic"],
@@ -286,6 +393,7 @@ test("new uploads automatically finish and enter the wardrobe", async (context) 
       }
       if (request.url === "/images/edits") {
         imageRequests += 1;
+        if (imageRequests === 2) modeledImageInputCount = (requestBody.toString("latin1").match(/name="image\[\]"/g) || []).length;
         response.end(JSON.stringify({ data: [{ b64_json: TEST_GARMENT_RESULT.toString("base64") }] }));
         return;
       }
@@ -298,6 +406,7 @@ test("new uploads automatically finish and enter the wardrobe", async (context) 
 
   process.env.WARDROBE_DATA_DIR = dataDir;
   process.env.WARDROBE_MODEL_REFERENCE = referenceFile;
+  process.env.WARDROBE_MODEL_REFERENCES_DIR = referencesDir;
   process.env.WARDROBE_IMPORT_CONCURRENCY = "2";
   process.env.OPENAI_API_KEY = "test-project-key";
   process.env.OPENAI_API_BASE_URL = `http://127.0.0.1:${openAIAddress.port}`;
@@ -315,6 +424,7 @@ test("new uploads automatically finish and enter the wardrobe", async (context) 
     await new Promise((resolve) => openAI.close(resolve));
     delete process.env.WARDROBE_DATA_DIR;
     delete process.env.WARDROBE_MODEL_REFERENCE;
+    delete process.env.WARDROBE_MODEL_REFERENCES_DIR;
     delete process.env.WARDROBE_IMPORT_CONCURRENCY;
     delete process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_API_BASE_URL;
@@ -334,10 +444,16 @@ test("new uploads automatically finish and enter the wardrobe", async (context) 
 
   const imported = await waitFor(async () => {
     const items = await (await fetch(`${baseUrl}/api/import/wardrobe`)).json();
-    return items.find((item) => item.name === "Automatic red shirt" && item.modeledImage);
+    return items.find((item) => item.productName === "Pace Breaker Linerless Short 7\"" && item.modeledImage);
   }, 5000);
-  assert.equal(imported.part, "upperbody");
+  assert.equal(imported.part, "lowerbody");
+  assert.equal(imported.name, "Lululemon Pace Breaker Linerless Short 7\"");
+  assert.equal(imported.productConfidence, "exact");
+  assert.equal(imported.productUrl, "https://shop.lululemon.com/p/men-shorts/Pace-Breaker-Short-7-Linerless/");
+  assert.equal(productSearchRequests, 1);
   assert.equal(imageRequests, 2);
+  assert.equal(modeledImageInputCount, 3);
+  assert.equal((await readFile(path.join(dataDir, "imported", `${imported.id}-source.png`))).subarray(1, 4).toString("ascii"), "PNG");
 
   const remainingJobs = await (await fetch(`${baseUrl}/api/import/jobs`)).json();
   assert.equal(remainingJobs.length, 0);

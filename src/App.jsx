@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Check, Plus, Trash, X } from "@phosphor-icons/react";
+import { ArrowSquareOut, Check, MagnifyingGlass, Plus, SpinnerGap, Trash, X } from "@phosphor-icons/react";
 import { WardrobeImportFlow } from "./import-flow.jsx";
 import { OptimizedImage } from "./OptimizedImage.jsx";
 
@@ -311,7 +311,7 @@ function ItemEditor({ draft, setDraft, palette, sampling, setSampling, sampleSta
   );
 }
 
-function ItemViewer({ item, onClose, onSave, onDelete }) {
+function ItemViewer({ item, onClose, onSave, onDelete, onIdentifyProduct }) {
   const closeButtonRef = useRef(null);
   const imageRef = useRef(null);
   const samplingCanvasRef = useRef(null);
@@ -325,6 +325,7 @@ function ItemViewer({ item, onClose, onSave, onDelete }) {
   const [saving, setSaving] = useState(false);
   const [actionError, setActionError] = useState("");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [matchingProduct, setMatchingProduct] = useState(false);
   const type = TYPE_MAP[item.part]?.singular || "Wardrobe item";
   const hasModeledImage = Boolean(item.modeledImage);
   const pieceRotation = useMemo(() => {
@@ -391,6 +392,7 @@ function ItemViewer({ item, onClose, onSave, onDelete }) {
     setSampleStatus("");
     setActionError("");
     setConfirmingDelete(false);
+    setMatchingProduct(false);
     setPalette(item.palette || []);
     setDraft({ name: item.name || "", part: item.part, color: item.color || "#9a9286", secondaryColor: item.secondaryColor || null, tags: [...(item.tags || [])] });
   }, [item]);
@@ -426,6 +428,20 @@ function ItemViewer({ item, onClose, onSave, onDelete }) {
       setActionError(error.message);
       setConfirmingDelete(false);
       setSaving(false);
+    }
+  };
+
+  const identifyProduct = async () => {
+    setMatchingProduct(true);
+    setActionError("");
+    try {
+      const matched = await onIdentifyProduct(item.id);
+      setDraft({ name: matched.name || "", part: matched.part, color: matched.color || "#9a9286", secondaryColor: matched.secondaryColor || null, tags: [...(matched.tags || [])] });
+      setSampleStatus(matched.productConfidence === "exact" ? "Exact product match saved." : matched.productConfidence === "likely" ? "Possible product match saved with its source." : "No exact product match was supported by the photo.");
+    } catch (error) {
+      setActionError(error.message);
+    } finally {
+      setMatchingProduct(false);
     }
   };
 
@@ -514,6 +530,17 @@ function ItemViewer({ item, onClose, onSave, onDelete }) {
           setSampling={setSampling}
           sampleStatus={sampleStatus}
         />
+
+        <section className="product-evidence" aria-label="Product identification">
+          <div className="product-evidence__heading"><div><span>Product match</span><strong>{item.productName ? [item.brand, item.productName].filter(Boolean).join(" ") : "Not identified yet"}</strong></div>{item.productConfidence && item.productConfidence !== "unknown" && <em data-confidence={item.productConfidence}>{item.productConfidence === "exact" ? "Exact" : "Possible"}</em>}</div>
+          {item.productColorway && <p>Colorway: {item.productColorway}</p>}
+          {item.productMatchSummary && <p>{item.productMatchSummary}</p>}
+          {!!item.productEvidence?.length && <ul>{item.productEvidence.slice(0, 3).map((evidence) => <li key={evidence}>{evidence}</li>)}</ul>}
+          <div className="product-evidence__actions">
+            <button type="button" onClick={identifyProduct} disabled={saving || matchingProduct || isDirty} title={isDirty ? "Save your edits before checking the product" : undefined}>{matchingProduct ? <SpinnerGap size={14} className="product-match-spinner" /> : <MagnifyingGlass size={14} />} {matchingProduct ? "Checking product" : item.productName ? "Check again" : "Identify product"}</button>
+            {item.productUrl && <a href={item.productUrl} target="_blank" rel="noreferrer">View source <ArrowSquareOut size={13} /></a>}
+          </div>
+        </section>
 
         {closeBlocked && <p className="unsaved-notice" role="status">Save or cancel changes before closing.</p>}
         {actionError && <p className="viewer-action-error" role="alert">{actionError}</p>}
@@ -655,6 +682,25 @@ export function App() {
     setConnection("connected");
   };
 
+  const identifyProduct = async (id) => {
+    let response;
+    try {
+      response = await fetch(`/api/import/wardrobe/${id}/product-match`, { method: "POST" });
+    } catch {
+      setConnection("saved");
+      throw new Error("Connect to the wardrobe on your computer, then check the product again.");
+    }
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || "Could not identify this product.");
+    setItems((current) => {
+      const next = current.map((item) => item.id === result.id ? result : item);
+      persistSnapshot(next);
+      return next;
+    });
+    setConnection("connected");
+    return result;
+  };
+
   const addImportedItem = useCallback((newItem) => {
     setItems((current) => {
       const next = current.some((item) => item.id === newItem.id) ? current : [...current, newItem];
@@ -723,7 +769,7 @@ export function App() {
         )}
       </main>
 
-      {selectedItem && <ItemViewer item={selectedItem} onClose={() => setSelectedId(null)} onSave={saveItem} onDelete={deleteItem} />}
+      {selectedItem && <ItemViewer item={selectedItem} onClose={() => setSelectedId(null)} onSave={saveItem} onDelete={deleteItem} onIdentifyProduct={identifyProduct} />}
       <WardrobeImportFlow onGarmentApproved={addImportedItem} onModeledApproved={attachImportedModeledImage} />
     </div>
   );
